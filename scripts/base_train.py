@@ -168,6 +168,7 @@ min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
+results = {"core_metric": float("nan"), "centered_results": None}
 # note that we run +1 steps only so that we can eval and save at the end
 for step in range(num_iterations + 1):
     last_step = step == num_iterations
@@ -191,20 +192,48 @@ for step in range(num_iterations + 1):
         })
         model.train()
 
+    # save checkpoint at the end of the run (only on master process)
+    if master_process and last_step:
+        output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+        checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            orig_model.state_dict(),
+            [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
+            {
+                "step": step,
+                "val_bpb": val_bpb, # loss at last step
+                "model_config": model_config_kwargs,
+                "user_config": user_config, # inputs to the training script
+                "device_batch_size": device_batch_size,
+                "max_seq_len": max_seq_len,
+            }
+        )
+
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
     if last_step or (step > 0 and step % core_metric_every == 0):
         model.eval()
-        with autocast_ctx:
-            results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
-        model.train()
+        try:
+            with autocast_ctx:
+                res = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
+            results = res  # 성공 시 결과 갱신
+            print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+            wandb_run.log({
+                "step": step,
+                "total_training_flops": flops_so_far,
+                "core_metric": results["core_metric"],
+                "centered_results": results["centered_results"],
+            })
+        except FileNotFoundError as e:
+            print0(f"Skipping CORE eval (missing bundle): {e}")
+            # 결과는 위에서 준비한 기본값 유지
+            # wandb에 굳이 올리지 않음 (원하면 NaN 업로드 가능)
+        except Exception as e:
+            print0(f"Skipping CORE eval (unexpected error): {e}")
+        finally:
+            model.train()
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
@@ -226,25 +255,6 @@ for step in range(num_iterations + 1):
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
-
-    # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step:
-        output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(),
-            [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
-            {
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": device_batch_size,
-                "max_seq_len": max_seq_len,
-            }
-        )
 
     if last_step:
         break
@@ -311,8 +321,8 @@ print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 # Log to report
 from nanochat.report import get_report
 get_report().log(section="Base model training", data=[
-    user_config, # CLI args
-    { # stats about the training setup
+    user_config,
+    {
         "Number of parameters": num_params,
         "Number of FLOPs per token": f"{num_flops_per_token:e}",
         "Calculated number of iterations": num_iterations,
@@ -323,10 +333,10 @@ get_report().log(section="Base model training", data=[
         "warmdown_ratio": warmdown_ratio,
         "final_lr_frac": final_lr_frac,
     },
-    { # stats about training outcomes
+    {
         "Minimum validation bpb": min_val_bpb,
         "Final validation bpb": val_bpb,
-        "CORE metric estimate": results["core_metric"],
+        "CORE metric estimate": results.get("core_metric", float("nan")),
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
